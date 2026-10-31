@@ -31,6 +31,14 @@
 
 ## Быстрый старт
 
+Интерактивно — скрипт сам спросит домен и email (вопросы идут через `/dev/tty`, поэтому работают и при запуске через пайп):
+
+```bash
+wget -qO- https://raw.githubusercontent.com/paratrupper/simple-nginx-xray-warpout/refs/heads/main/install.sh | sudo bash
+```
+
+Или с флагами, без вопросов:
+
 ```bash
 sudo bash install.sh --domain vpn.example.com --email you@example.com
 ```

@@ -76,13 +76,13 @@ usage() {
 simple-nginx-xray-warpout — VLESS+REALITY installer (self-steal, nginx decoy, WARP)
 
 Usage:
-  bash install.sh --domain example.com --email you@example.com [options]
+  bash install.sh [--domain example.com] [--email you@example.com] [options]
   bash install.sh --add-user [name]
   bash install.sh --links | --status | --uninstall
 
 Options:
-  --domain NAME          domain for SNI / serverNames / certificate (required)
-  --email ADDR           Let's Encrypt account email (default admin@<domain>)
+  --domain NAME          domain for SNI / serverNames / certificate (asked if omitted)
+  --email ADDR           Let's Encrypt account email (asked if omitted)
   --endpoint HOST        address used in the client link (default: detected IPv6)
   --warp all|off         route all traffic through Cloudflare WARP (default all)
   --block-ru             block .ru/.xn--p1ai/.su and geoip:ru (default)
@@ -107,6 +107,10 @@ USAGE
 
 require_root() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "run as root (sudo -i)"
+}
+
+have_tty() {
+  [[ -r /dev/tty ]] && ( : < /dev/tty ) 2>/dev/null
 }
 
 port_listening() {
@@ -230,18 +234,19 @@ load_state() {
 
 collect_params() {
   if [[ -z $DOMAIN ]]; then
-    if [[ $NONINTERACTIVE -eq 1 || ! -t 0 ]]; then
-      die "--domain is required"
+    if [[ $NONINTERACTIVE -eq 1 ]] || ! have_tty; then
+      die "--domain is required (no terminal to prompt)"
     fi
-    read -rp "Domain (SNI, must resolve to this server): " DOMAIN < /dev/tty
+    read -rp "Domain (SNI, must resolve to this server): " DOMAIN < /dev/tty \
+      || die "no input"
   fi
   DOMAIN=$(normalize_domain "$DOMAIN")
   [[ $DOMAIN =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]] || die "invalid domain: $DOMAIN"
 
   if [[ -z $EMAIL ]]; then
     EMAIL="admin@$DOMAIN"
-    if [[ $NONINTERACTIVE -eq 0 && -t 0 ]]; then
-      read -rp "Email for Let's Encrypt [$EMAIL]: " _email < /dev/tty
+    if [[ $NONINTERACTIVE -eq 0 ]] && have_tty; then
+      read -rp "Email for Let's Encrypt [$EMAIL]: " _email < /dev/tty || true
       [[ -n ${_email:-} ]] && EMAIL=$_email
     fi
   fi
@@ -942,8 +947,9 @@ do_uninstall() {
   [[ -n $domain ]] || domain=$DOMAIN
 
   if [[ $FORCE -eq 0 ]]; then
-    if [[ -t 0 ]]; then
-      read -rp "Remove Xray, nginx site '${domain:-?}' and installer state? [y/N] " ans < /dev/tty
+    if have_tty; then
+      read -rp "Remove Xray, nginx site '${domain:-?}' and installer state? [y/N] " ans < /dev/tty \
+        || die "aborted"
       [[ ${ans:-} == y* ]] || { echo "aborted"; exit 1; }
     else
       die "pass --force to uninstall non-interactively"
