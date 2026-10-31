@@ -94,6 +94,7 @@ sudo bash install.sh --domain vpn.example.com --email you@example.com --warp off
 | `--transport tcp\|grpc\|xhttp` | `tcp` — Vision (по умолчанию), `grpc`/`xhttp` — мультиплексирование |
 | `--service-name NAME` | имя gRPC-сервиса (генерируется автоматически) |
 | `--xhttp-path PATH` | путь XHTTP (генерируется автоматически) |
+| `--tcp-port PORT` | TCP+Vision fallback для gRPC/XHTTP (по умолчанию 2053, 0 — выключить) |
 | `--regen-keys` | новые UUID, ключи Reality, shortId |
 | `--force` | переустановка поверх |
 | `--non-interactive` | без вопросов (нужны `--domain`, `--email`) |
@@ -193,6 +194,18 @@ bash install.sh --transport xhttp
 Важно: stock sing-box XHTTP не поддерживает (только HTTP, WS, QUIC, gRPC, HTTPUpgrade). Режим рассчитан на Xray-клиенты (v2rayN, v2rayNG, NekoBox с Xray core) или sing-box-extended. Для обычного sing-box используйте gRPC.
 
 Ссылка получает `type=xhttp&path=...&host=...&mode=stream-up`, без `flow`. Обратно — `--transport tcp`.
+
+### TCP fallback для AmneziaVPN
+
+AmneziaVPN (и часть других клиентов) умеет только VLESS+Reality по TCP и не понимает gRPC/XHTTP: ссылка импортируется, но приложение соединяется как TCP, и сервер закрывает соединение.
+
+Поэтому при `--transport grpc` или `--transport xhttp` установщик дополнительно поднимает TCP+Vision inbound на порту **2053**:
+
+- ссылка печатается в конце установки и в `xray-manage links`;
+- порт открывается в ufw;
+- отключить: `--tcp-port 0`, сменить: `--tcp-port 8444`.
+
+Это отдельный общий пользователь (`tcp-fallback`), он не появляется в `user list` и не мешает основным пользователям.
 
 ## Ограничения и риски
 

@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 
 APP_NAME="simple-nginx-xray-warpout"
-APP_VERSION="1.3.1"
+APP_VERSION="1.4.0"
 
 STATE_DIR="/etc/xray-installer"
 STATE_FILE="$STATE_DIR/state.json"
@@ -43,6 +43,9 @@ TRANSPORT="tcp"
 TRANSPORT_SET=0
 GRPC_SERVICE=""
 XHTTP_PATH=""
+TCP_PORT=2053
+TCP_PORT_SET=0
+TCP_UUID=""
 ACTION="install"
 ADD_USER_NAME=""
 
@@ -98,6 +101,7 @@ Options:
   --transport tcp|grpc|xhttp   tcp = Vision (default), grpc = H2 mux, xhttp = HTTP mux (Xray clients)
   --service-name NAME    gRPC service name (generated automatically for grpc)
   --xhttp-path PATH      XHTTP path (generated automatically for xhttp)
+  --tcp-port PORT        extra TCP+Vision inbound when transport is grpc/xhttp (default 2053; 0 disables)
   --block-ru             block .ru/.xn--p1ai/.su and geoip:ru (default)
   --no-block-ru          do not block Russian destinations
   --cert-method http|dns|none   certificate source (default http)
@@ -179,6 +183,12 @@ make_link() {
     "$uuid" "$(link_host "$host")" "$flowparam" "$DOMAIN" "$PUBLIC_KEY" "$SHORT_ID" "$typeparam" "$DOMAIN"
 }
 
+make_tcp_link() {
+  local host=$1
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=firefox&pbk=%s&sid=%s&type=tcp#%s-tcp\n' \
+    "$TCP_UUID" "$(link_host "$host")" "$TCP_PORT" "$DOMAIN" "$PUBLIC_KEY" "$SHORT_ID" "$DOMAIN"
+}
+
 # --------------------------------------------------------------- arg parse --
 
 while [[ $# -gt 0 ]]; do
@@ -197,6 +207,7 @@ while [[ $# -gt 0 ]]; do
     --transport)     [[ $# -ge 2 ]] || die "--transport needs a value"; TRANSPORT=$2; TRANSPORT_SET=1; shift 2 ;;
     --service-name)  [[ $# -ge 2 ]] || die "--service-name needs a value"; GRPC_SERVICE=$2; shift 2 ;;
     --xhttp-path)    [[ $# -ge 2 ]] || die "--xhttp-path needs a value"; XHTTP_PATH=$2; shift 2 ;;
+    --tcp-port)      [[ $# -ge 2 ]] || die "--tcp-port needs a value"; TCP_PORT=$2; TCP_PORT_SET=1; shift 2 ;;
     --enable-mux)    ACTION="enable-mux"; shift ;;
     --disable-mux)   ACTION="disable-mux"; shift ;;
     --regen-keys)    REGEN_KEYS=1; shift ;;
@@ -219,6 +230,7 @@ if [[ $MUX -eq 1 && $TRANSPORT != "tcp" ]]; then
   die "--mux is only for tcp; grpc and xhttp already multiplex"
 fi
 [[ $SSH_PORT =~ ^[0-9]+$ ]] || die "--ssh-port must be numeric"
+[[ $TCP_PORT =~ ^[0-9]+$ ]] || die "--tcp-port must be numeric"
 
 # ------------------------------------------------------------------ install --
 
@@ -261,6 +273,14 @@ load_state() {
   fi
   v=$(jq -r '.endpoint // empty' "$STATE_FILE" 2>/dev/null || true)
   [[ -n $v && -z $ENDPOINT ]] && ENDPOINT=$v
+  if [[ $WARP_SET -eq 0 ]]; then
+    v=$(jq -r '.warp // empty' "$STATE_FILE" 2>/dev/null || true)
+    if [[ $v == "all" || $v == "off" ]]; then WARP=$v; fi
+  fi
+  if [[ $BLOCK_RU_SET -eq 0 ]]; then
+    v=$(jq -r '.block_ru // empty' "$STATE_FILE" 2>/dev/null || true)
+    if [[ $v == "true" ]]; then BLOCK_RU=1; elif [[ $v == "false" ]]; then BLOCK_RU=0; fi
+  fi
   load_transport_state
   load_mux_state
   return 0
@@ -317,6 +337,12 @@ collect_params() {
   if [[ $MUX -eq 1 && $TRANSPORT != "tcp" ]]; then
     die "--mux is only for tcp; grpc and xhttp already multiplex"
   fi
+  if [[ $TRANSPORT == "tcp" ]]; then
+    TCP_PORT=0
+  fi
+  if [[ $TCP_PORT -eq 443 ]]; then
+    die "--tcp-port cannot be 443 (it is the main inbound)"
+  fi
 
   if [[ -z $ENDPOINT ]]; then
     ENDPOINT=$(detect_ipv6 || true)
@@ -345,6 +371,13 @@ check_ports() {
   p443=$(ss -lntpH -p 2>/dev/null | awk '$4 ~ /:443$/') || true
   if [[ -n $p443 ]] && ! grep -q 'xray' <<<"$p443"; then
     die "port 443 is already in use: $p443"
+  fi
+  if [[ ${TCP_PORT:-0} -gt 0 && $TCP_PORT -ne 443 ]]; then
+    local ptcp
+    ptcp=$(ss -lntpH -p 2>/dev/null | awk -v port=":$TCP_PORT" '$4 ~ (port "$")') || true
+    if [[ -n $ptcp ]] && ! grep -q 'xray' <<<"$ptcp"; then
+      die "port $TCP_PORT is already in use: $ptcp"
+    fi
   fi
   addrs=$(ss -lntH 2>/dev/null | awk '{print $4}') || true
   grep -qE "[:.]${SSH_PORT}$" <<<"$addrs" || die "sshd is not listening on port $SSH_PORT; pass --ssh-port"
@@ -389,6 +422,9 @@ setup_firewall() {
   ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
   ufw allow 80/tcp >/dev/null 2>&1 || true
   ufw allow 443/tcp >/dev/null 2>&1 || true
+  if [[ ${TCP_PORT:-0} -gt 0 && $TCP_PORT -ne 443 ]]; then
+    ufw allow "${TCP_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
   if [[ -f /etc/default/ufw ]]; then
     sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
   fi
@@ -598,6 +634,9 @@ generate_credentials() {
   if [[ -z $SHORT_ID ]]; then
     SHORT_ID=$(openssl rand -hex 8)
   fi
+  if [[ $TRANSPORT != "tcp" && $TCP_PORT -gt 0 && -z $TCP_UUID ]]; then
+    TCP_UUID=$(xray uuid) || die "cannot generate TCP fallback UUID"
+  fi
 }
 
 download_wgcf() {
@@ -695,7 +734,7 @@ write_xray_config() {
   log "writing Xray config"
   mkdir -p "$XRAY_DIR"
 
-  local base rules default_rule wg client_json
+  local base rules default_rule wg client_json tcp_in
   if [[ $TRANSPORT == "grpc" || $MUX -eq 1 ]]; then
     client_json=$(jq -n --arg uuid "$UUID_VALUE" '{id:$uuid, email:"user1"}')
   else
@@ -747,6 +786,39 @@ write_xray_config() {
     base=$(jq --arg path "$XHTTP_PATH" --arg host "$DOMAIN" \
       '.inbounds[0].streamSettings.xhttpSettings = {path:$path, host:$host, mode:"auto"}' <<<"$base") \
       || die "cannot add XHTTP settings"
+  fi
+
+  if [[ $TRANSPORT != "tcp" && $TCP_PORT -gt 0 ]]; then
+    tcp_in=$(jq -n \
+      --arg uuid "$TCP_UUID" \
+      --arg domain "$DOMAIN" \
+      --arg priv "$PRIVATE_KEY" \
+      --arg sid "$SHORT_ID" \
+      --argjson port "$TCP_PORT" \
+      '{
+        tag: "vless-reality-tcp",
+        listen: "::",
+        port: $port,
+        protocol: "vless",
+        settings: {
+          clients: [{id: $uuid, flow: "xtls-rprx-vision", email: "tcp-fallback"}],
+          decryption: "none"
+        },
+        streamSettings: {
+          network: "tcp",
+          security: "reality",
+          realitySettings: {
+            target: "127.0.0.1:8443",
+            xver: 0,
+            serverNames: [$domain],
+            privateKey: $priv,
+            shortIds: [$sid]
+          }
+        },
+        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+      }') || die "cannot build TCP fallback inbound"
+    base=$(jq --argjson t "$tcp_in" '.inbounds += [$t]' <<<"$base") \
+      || die "cannot add TCP fallback inbound"
   fi
 
   rules='[]'
@@ -834,6 +906,9 @@ verify_install() {
   port_listening 443 || die "443 is not listening"
   port_listening 80 || die "80 is not listening"
   port_listening 8443 || die "127.0.0.1:8443 is not listening"
+  if [[ ${TCP_PORT:-0} -gt 0 && $TCP_PORT -ne 443 ]]; then
+    port_listening "$TCP_PORT" || die "$TCP_PORT is not listening"
+  fi
 
   local ok_decoy=0
   if decoy_ok; then ok_decoy=1; fi
@@ -878,11 +953,14 @@ save_state() {
     --arg transport "$TRANSPORT" \
     --arg grpc "$GRPC_SERVICE" \
     --arg xhttp "$XHTTP_PATH" \
+    --argjson tcp_port "$TCP_PORT" \
+    --arg tcp_uuid "$TCP_UUID" \
     --arg cert "$CERT_CRT" \
     --arg installed "$(date -Is)" \
     '{domain:$domain, uuid:$uuid, private_key:$priv, public_key:$pub, short_id:$sid,
       endpoint:$endpoint, warp:$warp, block_ru:$block_ru, mux:$mux,
-      transport:$transport, grpc_service:$grpc, xhttp_path:$xhttp, cert:$cert, installed_at:$installed}' \
+      transport:$transport, grpc_service:$grpc, xhttp_path:$xhttp,
+      tcp_port:$tcp_port, tcp_uuid:$tcp_uuid, cert:$cert, installed_at:$installed}' \
     > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
@@ -944,6 +1022,14 @@ print_links() {
     dom=$(make_link "$DOMAIN" "$UUID_VALUE")
     printf '\n%s--- client link (domain, AAAA is live) ---%s\n%s\n' "$C_BLU" "$C_OFF" "$dom"
   fi
+  if [[ $TCP_PORT -gt 0 && $TRANSPORT != "tcp" ]]; then
+    printf '\n%s--- TCP fallback :%s (AmneziaVPN and other TCP-only clients) ---%s\n' \
+      "$C_BLU" "$TCP_PORT" "$C_OFF"
+    make_tcp_link "$ENDPOINT"
+    if getent ahostsv6 "$DOMAIN" >/dev/null 2>&1; then
+      make_tcp_link "$DOMAIN"
+    fi
+  fi
   if [[ $DO_QR -eq 1 ]] && command -v qrencode >/dev/null; then
     printf '\n'
     qrencode -t ANSIUTF8 "$lit" || true
@@ -964,6 +1050,7 @@ ${C_GRN}Installation complete${C_OFF}
   WARP         : $WARP
   block RU     : $BLOCK_RU
   transport    : $TRANSPORT${GRPC_SERVICE:+ ($GRPC_SERVICE)}${XHTTP_PATH:+ ($XHTTP_PATH)}
+  tcp fallback : ${TCP_PORT}
   mux          : $MUX
   certificate  : $CERT_CRT
 
@@ -1051,6 +1138,12 @@ load_transport_state() {
   if [[ -n $v && -z $GRPC_SERVICE ]]; then GRPC_SERVICE=$v; fi
   v=$(jq -r '.xhttp_path // empty' "$STATE_FILE" 2>/dev/null || true)
   if [[ -n $v && -z $XHTTP_PATH ]]; then XHTTP_PATH=$v; fi
+  if [[ $TCP_PORT_SET -eq 0 ]] && jq -e 'has("tcp_port")' "$STATE_FILE" >/dev/null 2>&1; then
+    v=$(jq -r '.tcp_port' "$STATE_FILE" 2>/dev/null || true)
+    if [[ $v =~ ^[0-9]+$ ]]; then TCP_PORT=$v; fi
+  fi
+  v=$(jq -r '.tcp_uuid // empty' "$STATE_FILE" 2>/dev/null || true)
+  if [[ -n $v && -z $TCP_UUID ]]; then TCP_UUID=$v; fi
   return 0
 }
 
@@ -1143,6 +1236,14 @@ do_links() {
     fi
     printf '\n'
   done < <(jq -r '.inbounds[0].settings.clients[] | [(.email // "user"), .id] | @tsv' "$XRAY_CONF")
+  if [[ $TCP_PORT -gt 0 && $TRANSPORT != "tcp" ]]; then
+    printf '%s--- TCP fallback :%s ---%s\n' "$C_BLU" "$TCP_PORT" "$C_OFF"
+    make_tcp_link "$ENDPOINT"
+    if getent ahostsv6 "$DOMAIN" >/dev/null 2>&1; then
+      make_tcp_link "$DOMAIN"
+    fi
+    printf '\n'
+  fi
   mux_note
   grpc_note
   xhttp_note

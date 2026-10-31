@@ -19,6 +19,8 @@ GRPC_SERVICE=""
 XHTTP_PATH=""
 MUX="false"
 WARP="all"
+TCP_PORT=0
+TCP_UUID=""
 
 die() { echo "xray-manage: $*" >&2; exit 1; }
 ok()  { echo "ok: $*"; }
@@ -59,6 +61,8 @@ load_state() {
   XHTTP_PATH=$(jq -r '.xhttp_path // empty' "$STATE_FILE")
   MUX=$(jq -r '.mux // false' "$STATE_FILE")
   WARP=$(jq -r '.warp // "all"' "$STATE_FILE")
+  TCP_PORT=$(jq -r '.tcp_port // 0' "$STATE_FILE")
+  TCP_UUID=$(jq -r '.tcp_uuid // empty' "$STATE_FILE")
 }
 
 link_host() {
@@ -83,6 +87,12 @@ make_link() {
   esac
   printf 'vless://%s@%s:443?encryption=none%s&security=reality&sni=%s&fp=firefox&pbk=%s&sid=%s&%s#%s\n' \
     "$id" "$(link_host "$host")" "$flow" "$DOMAIN" "$PUBLIC_KEY" "$SHORT_ID" "$type" "$DOMAIN"
+}
+
+make_tcp_link() {
+  local host=$1
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=firefox&pbk=%s&sid=%s&type=tcp#%s-tcp\n' \
+    "$TCP_UUID" "$(link_host "$host")" "$TCP_PORT" "$DOMAIN" "$PUBLIC_KEY" "$SHORT_ID" "$DOMAIN"
 }
 
 fix_xray_perms() {
@@ -135,6 +145,14 @@ print_links() {
     make_link "$ENDPOINT" "$id"
     printf '\n'
   done < <(jq -r '.inbounds[0].settings.clients[] | [(.email // "user"), .id] | @tsv' "$XRAY_CONF")
+  if [[ ${TCP_PORT:-0} -gt 0 && $TRANSPORT != "tcp" ]]; then
+    echo "--- tcp fallback :$TCP_PORT ---"
+    make_tcp_link "$ENDPOINT"
+    if getent ahostsv6 "$DOMAIN" >/dev/null 2>&1; then
+      make_tcp_link "$DOMAIN"
+    fi
+    printf '\n'
+  fi
 }
 
 cmd_status() {
@@ -146,7 +164,7 @@ cmd_status() {
   echo "--- services ---"
   systemctl is-active xray nginx 2>/dev/null || true
   echo "--- listeners ---"
-  ss -lntp 2>/dev/null | grep -E ':(80|443|8443)\b' || true
+  ss -lntp 2>/dev/null | grep -E ":(80|443|8443|${TCP_PORT})\\b" || true
   echo "--- certificate ---"
   local cert
   cert=$(jq -r '.cert // empty' "$STATE_FILE")
