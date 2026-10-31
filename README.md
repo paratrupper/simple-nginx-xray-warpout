@@ -112,7 +112,7 @@ vless://UUID@[IPv6]:443?encryption=none&flow=xtls-rprx-vision&security=reality&s
 sudo bash install.sh --add-user phone
 ```
 
-Команда добавляет UUID в конфиг, перезапускает Xray и печатает ссылку. `--links` показывает ссылки всех текущих пользователей (по сохранённому состоянию).
+Команда добавляет UUID в конфиг, перезапускает Xray и печатает ссылку. `--links` показывает ссылки всех текущих пользователей (по сохранённому состоянию). Имя пользователя (email) должно быть уникальным: повторное добавление теперь даёт понятную ошибку, а не «config test failed».
 
 ## Управление
 
@@ -180,7 +180,7 @@ bash install.sh --transport grpc
 bash install.sh --transport tcp
 ```
 
-Ограничения: gRPC медленнее RAW/Vision на больших загрузках, а Vision с ним недоступен. Для одного пользователя и браузинга это обычно приемлемая плата за стабильность.
+Ограничения: gRPC медленнее RAW/Vision на больших загрузках, а Vision с ним недоступен. Xray 26.10 уже помечает gRPC как deprecated и советует XHTTP stream-up, но для stock sing-box альтернативы нет.
 
 ### XHTTP
 
@@ -192,7 +192,7 @@ bash install.sh --transport xhttp
 
 Важно: stock sing-box XHTTP не поддерживает (только HTTP, WS, QUIC, gRPC, HTTPUpgrade). Режим рассчитан на Xray-клиенты (v2rayN, v2rayNG, NekoBox с Xray core) или sing-box-extended. Для обычного sing-box используйте gRPC.
 
-Ссылка получает `type=xhttp&path=...&host=...&mode=auto`, без `flow`. Обратно — `--transport tcp`.
+Ссылка получает `type=xhttp&path=...&host=...&mode=stream-up`, без `flow`. Обратно — `--transport tcp`.
 
 ## Ограничения и риски
 

@@ -77,7 +77,7 @@ make_link() {
       type="type=grpc&serviceName=$GRPC_SERVICE" ;;
     xhttp)
       enc=${XHTTP_PATH//\//%2F}
-      type="type=xhttp&path=$enc&host=$DOMAIN&mode=auto" ;;
+      type="type=xhttp&path=$enc&host=$DOMAIN&mode=stream-up" ;;
     tcp)
       [[ $MUX == "true" ]] || flow="&flow=xtls-rprx-vision" ;;
   esac
@@ -105,7 +105,7 @@ restart_xray() {
 
 edit_config() {
   # edit_config <jq-args...> -- <filter>
-  local tmp="$XRAY_CONF.tmp"
+  local tmp="$XRAY_CONF.tmp.json"
   local backup="$XRAY_CONF.bak.$$"
   cp -a "$XRAY_CONF" "$backup"
 
@@ -115,14 +115,15 @@ edit_config() {
     rm -f "$tmp" "$backup"
     die "jq failed"
   fi
+
+  local out
+  if ! out=$(xray run -test -config "$tmp" 2>&1); then
+    rm -f "$tmp" "$backup"
+    die "config test failed: $out"
+  fi
+
   mv "$tmp" "$XRAY_CONF"
   fix_xray_perms
-
-  if ! xray run -test -c "$XRAY_CONF" >/dev/null 2>&1; then
-    mv "$backup" "$XRAY_CONF"
-    fix_xray_perms
-    die "config test failed; change reverted"
-  fi
   rm -f "$backup"
 }
 
@@ -173,11 +174,17 @@ cmd_user_list() {
 cmd_user_add() {
   require_state
   load_state
-  local name="${1:-}" count id flowval=""
+  local name="${1:-}" count id flowval="" net
   count=$(jq '.inbounds[0].settings.clients | length' "$XRAY_CONF")
   [[ -n $name ]] || name="user$((count + 1))"
+  if jq -e --arg e "$name" \
+       '.inbounds[0].settings.clients[] | select((.email // "") == $e)' \
+       "$XRAY_CONF" >/dev/null 2>&1; then
+    die "user '$name' already exists"
+  fi
   id=$(xray uuid)
-  if [[ $TRANSPORT == "tcp" && $MUX != "true" ]]; then flowval="xtls-rprx-vision"; fi
+  net=$(jq -r '.inbounds[0].streamSettings.network // "tcp"' "$XRAY_CONF")
+  if [[ $net == "tcp" && $MUX != "true" ]]; then flowval="xtls-rprx-vision"; fi
 
   edit_config --arg id "$id" --arg email "$name" --arg flow "$flowval" \
     '.inbounds[0].settings.clients += [({id:$id, email:$email} + (if $flow != "" then {flow:$flow} else {} end))]'

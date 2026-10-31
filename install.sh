@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 
 APP_NAME="simple-nginx-xray-warpout"
-APP_VERSION="1.3.0"
+APP_VERSION="1.3.1"
 
 STATE_DIR="/etc/xray-installer"
 STATE_FILE="$STATE_DIR/state.json"
@@ -171,7 +171,7 @@ make_link() {
     typeparam="type=grpc&serviceName=$GRPC_SERVICE"
   elif [[ $TRANSPORT == "xhttp" ]]; then
     enc_path=${XHTTP_PATH//\//%2F}
-    typeparam="type=xhttp&path=$enc_path&host=$DOMAIN&mode=auto"
+    typeparam="type=xhttp&path=$enc_path&host=$DOMAIN&mode=stream-up"
   elif [[ $MUX -eq 0 ]]; then
     flowparam="&flow=xtls-rprx-vision"
   fi
@@ -733,7 +733,7 @@ write_xray_config() {
         sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
       }],
       outbounds: [
-        {tag: "direct", protocol: "freedom", settings: {domainStrategy: "UseIP"}},
+        {tag: "direct", protocol: "freedom", settings: {}, streamSettings: {sockopt: {domainStrategy: "UseIP"}}},
         {tag: "block", protocol: "blackhole"}
       ],
       routing: {domainStrategy: "IPIfNonMatch", rules: []}
@@ -896,7 +896,7 @@ Stock sing-box does not support XHTTP: use an Xray-based client
 (v2rayN, v2rayNG, NekoBox with Xray core) or sing-box-extended.
   path: $XHTTP_PATH
   host: $DOMAIN
-  mode: auto
+  mode: stream-up (server: auto)
 EOF
 }
 
@@ -1070,31 +1070,47 @@ do_add_user() {
   load_transport_state
   load_mux_state
   [[ -f $XRAY_CONF ]] || die "missing $XRAY_CONF"
-  local name id backup link count flowval=""
+  local name id backup tmp link count flowval="" net testout
   count=$(jq '.inbounds[0].settings.clients | length' "$XRAY_CONF")
   name=${ADD_USER_NAME:-user$((count + 1))}
   id=$(xray uuid)
-  if [[ $TRANSPORT == "tcp" && $MUX -eq 0 ]]; then flowval="xtls-rprx-vision"; fi
+
+  if jq -e --arg e "$name" \
+       '.inbounds[0].settings.clients[] | select((.email // "") == $e)' \
+       "$XRAY_CONF" >/dev/null 2>&1; then
+    die "user '$name' already exists"
+  fi
+
+  net=$(jq -r '.inbounds[0].streamSettings.network // "tcp"' "$XRAY_CONF")
+  if [[ $net == "tcp" && $MUX -eq 0 ]]; then flowval="xtls-rprx-vision"; fi
 
   backup_file "$XRAY_CONF"
   backup="$XRAY_CONF.bak.$$"
+  tmp="$XRAY_CONF.tmp.json"
   cp -a "$XRAY_CONF" "$backup"
   if ! jq --arg id "$id" --arg email "$name" --arg flow "$flowval" \
        '.inbounds[0].settings.clients += [({id:$id, email:$email} + (if $flow != "" then {flow:$flow} else {} end))]' \
-       "$XRAY_CONF" > "$XRAY_CONF.tmp"; then
-    rm -f "$XRAY_CONF.tmp"
+       "$XRAY_CONF" > "$tmp"; then
+    rm -f "$tmp" "$backup"
     die "jq failed"
   fi
-  mv "$XRAY_CONF.tmp" "$XRAY_CONF"
+
+  if ! testout=$(xray run -test -config "$tmp" 2>&1); then
+    rm -f "$tmp" "$backup"
+    die "config test failed: $testout"
+  fi
+  mv "$tmp" "$XRAY_CONF"
   fix_xray_perms
-  if ! xray run -test -c "$XRAY_CONF" >/dev/null 2>&1; then
+
+  systemctl restart xray || true
+  sleep 1
+  if ! systemctl is-active --quiet xray; then
     mv "$backup" "$XRAY_CONF"
-    die "config test failed, change reverted"
+    fix_xray_perms
+    systemctl restart xray || true
+    die "Xray failed to restart; change reverted"
   fi
   rm -f "$backup"
-  systemctl restart xray
-  sleep 1
-  systemctl is-active --quiet xray || die "Xray failed to restart"
 
   DOMAIN=$(jq -r '.domain' "$STATE_FILE")
   PUBLIC_KEY=$(jq -r '.public_key' "$STATE_FILE")
