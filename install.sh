@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 
 APP_NAME="simple-nginx-xray-warpout"
-APP_VERSION="1.0.0"
+APP_VERSION="1.0.1"
 
 STATE_DIR="/etc/xray-installer"
 STATE_FILE="$STATE_DIR/state.json"
@@ -597,10 +597,14 @@ prepare_warp() {
 }
 
 fix_xray_perms() {
-  local grp
-  grp=$(id -gn nobody 2>/dev/null || echo nogroup)
-  chmod 755 "$XRAY_DIR"
-  chown root:"$grp" "$XRAY_CONF" 2>/dev/null || true
+  local user grp
+  user=$(systemctl show -p User --value xray 2>/dev/null || true)
+  [[ -n $user ]] || user="root"
+  grp=$(systemctl show -p Group --value xray 2>/dev/null || true)
+  [[ -n $grp ]] || grp=$(id -gn "$user" 2>/dev/null || echo root)
+
+  chown root:"$grp" "$XRAY_DIR" "$XRAY_CONF" 2>/dev/null || true
+  chmod 750 "$XRAY_DIR"
   chmod 640 "$XRAY_CONF"
 }
 
