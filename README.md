@@ -31,7 +31,7 @@
 
 ## Быстрый старт
 
-Интерактивно — скрипт сам спросит домен и email (вопросы идут через `/dev/tty`, поэтому работают и при запуске через пайп):
+Интерактивно — скрипт сам спросит домен, email, транспорт, WARP и блокировку RU (вопросы идут через `/dev/tty`, поэтому работают и при запуске через пайп):
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/paratrupper/simple-nginx-xray-warpout/refs/heads/main/install.sh | sudo bash
@@ -91,8 +91,9 @@ sudo bash install.sh --domain vpn.example.com --email you@example.com --warp off
 | `--ssh-port PORT` | SSH-порт, который останется открыт (по умолчанию 22) |
 | `--qr` | QR-код ссылки в терминале |
 | `--mux` | отключить Vision и разрешить Mux.Cool на клиенте |
-| `--transport tcp\|grpc` | `tcp` — Vision (по умолчанию), `grpc` — HTTP/2-мультиплексирование |
+| `--transport tcp\|grpc\|xhttp` | `tcp` — Vision (по умолчанию), `grpc`/`xhttp` — мультиплексирование |
 | `--service-name NAME` | имя gRPC-сервиса (генерируется автоматически) |
+| `--xhttp-path PATH` | путь XHTTP (генерируется автоматически) |
 | `--regen-keys` | новые UUID, ключи Reality, shortId |
 | `--force` | переустановка поверх |
 | `--non-interactive` | без вопросов (нужны `--domain`, `--email`) |
@@ -112,6 +113,23 @@ sudo bash install.sh --add-user phone
 ```
 
 Команда добавляет UUID в конфиг, перезапускает Xray и печатает ссылку. `--links` показывает ссылки всех текущих пользователей (по сохранённому состоянию).
+
+## Управление
+
+После установки появляется `/usr/local/bin/xray-manage` — для мелких операций без переустановки:
+
+```bash
+xray-manage status
+xray-manage links
+xray-manage user list
+xray-manage user add phone
+xray-manage user del phone
+xray-manage warp on
+xray-manage warp off
+xray-manage restart
+```
+
+`warp on` использует сохранённый wgcf-профиль и возвращает в конфиг WireGuard-outbound с балансером; `warp off` убирает его и переводит всё на direct. `user del` принимает имя или UUID.
 
 ## Диагностика
 
@@ -163,6 +181,18 @@ bash install.sh --transport tcp
 ```
 
 Ограничения: gRPC медленнее RAW/Vision на больших загрузках, а Vision с ним недоступен. Для одного пользователя и браузинга это обычно приемлемая плата за стабильность.
+
+### XHTTP
+
+`--transport xhttp` — HTTP-мультиплексирование поверх Reality: все потоки идут через одно TCP-соединение, path и host генерируются автоматически.
+
+```bash
+bash install.sh --transport xhttp
+```
+
+Важно: stock sing-box XHTTP не поддерживает (только HTTP, WS, QUIC, gRPC, HTTPUpgrade). Режим рассчитан на Xray-клиенты (v2rayN, v2rayNG, NekoBox с Xray core) или sing-box-extended. Для обычного sing-box используйте gRPC.
+
+Ссылка получает `type=xhttp&path=...&host=...&mode=auto`, без `flow`. Обратно — `--transport tcp`.
 
 ## Ограничения и риски
 

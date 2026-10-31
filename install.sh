@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 
 APP_NAME="simple-nginx-xray-warpout"
-APP_VERSION="1.2.0"
+APP_VERSION="1.3.0"
 
 STATE_DIR="/etc/xray-installer"
 STATE_FILE="$STATE_DIR/state.json"
@@ -21,12 +21,15 @@ NGINX_ENABLED="/etc/nginx/sites-enabled"
 WWW_ROOT="/var/www"
 LE_ROOT="/etc/letsencrypt/live"
 LOG_FILE="/var/log/xray-installer.log"
+MANAGE_URL="https://raw.githubusercontent.com/paratrupper/simple-nginx-xray-warpout/main/manage.sh"
 
 DOMAIN=""
 EMAIL=""
 ENDPOINT=""
 WARP="all"
+WARP_SET=0
 BLOCK_RU=1
+BLOCK_RU_SET=0
 CERT_METHOD="http"
 CF_TOKEN=""
 SSH_PORT="22"
@@ -39,6 +42,7 @@ MUX_SET=0
 TRANSPORT="tcp"
 TRANSPORT_SET=0
 GRPC_SERVICE=""
+XHTTP_PATH=""
 ACTION="install"
 ADD_USER_NAME=""
 
@@ -91,8 +95,9 @@ Options:
   --email ADDR           Let's Encrypt account email (asked if omitted)
   --endpoint HOST        address used in the client link (default: detected IPv6)
   --warp all|off         route all traffic through Cloudflare WARP (default all)
-  --transport tcp|grpc   tcp = Vision (default), grpc = HTTP/2 multiplexing (works with sing-box)
+  --transport tcp|grpc|xhttp   tcp = Vision (default), grpc = H2 mux, xhttp = HTTP mux (Xray clients)
   --service-name NAME    gRPC service name (generated automatically for grpc)
+  --xhttp-path PATH      XHTTP path (generated automatically for xhttp)
   --block-ru             block .ru/.xn--p1ai/.su and geoip:ru (default)
   --no-block-ru          do not block Russian destinations
   --cert-method http|dns|none   certificate source (default http)
@@ -161,9 +166,12 @@ link_host() {
 }
 
 make_link() {
-  local host=$1 uuid=$2 flowparam="" typeparam="type=tcp"
+  local host=$1 uuid=$2 flowparam="" typeparam="type=tcp" enc_path
   if [[ $TRANSPORT == "grpc" ]]; then
     typeparam="type=grpc&serviceName=$GRPC_SERVICE"
+  elif [[ $TRANSPORT == "xhttp" ]]; then
+    enc_path=${XHTTP_PATH//\//%2F}
+    typeparam="type=xhttp&path=$enc_path&host=$DOMAIN&mode=auto"
   elif [[ $MUX -eq 0 ]]; then
     flowparam="&flow=xtls-rprx-vision"
   fi
@@ -178,9 +186,9 @@ while [[ $# -gt 0 ]]; do
     --domain)        [[ $# -ge 2 ]] || die "--domain needs a value"; DOMAIN=$2; shift 2 ;;
     --email)         [[ $# -ge 2 ]] || die "--email needs a value"; EMAIL=$2; shift 2 ;;
     --endpoint)      [[ $# -ge 2 ]] || die "--endpoint needs a value"; ENDPOINT=$2; shift 2 ;;
-    --warp)          [[ $# -ge 2 ]] || die "--warp needs a value"; WARP=$2; shift 2 ;;
-    --block-ru)      BLOCK_RU=1; shift ;;
-    --no-block-ru)   BLOCK_RU=0; shift ;;
+    --warp)          [[ $# -ge 2 ]] || die "--warp needs a value"; WARP=$2; WARP_SET=1; shift 2 ;;
+    --block-ru)      BLOCK_RU=1; BLOCK_RU_SET=1; shift ;;
+    --no-block-ru)   BLOCK_RU=0; BLOCK_RU_SET=1; shift ;;
     --cert-method)   [[ $# -ge 2 ]] || die "--cert-method needs a value"; CERT_METHOD=$2; shift 2 ;;
     --cf-token)      [[ $# -ge 2 ]] || die "--cf-token needs a value"; CF_TOKEN=$2; shift 2 ;;
     --ssh-port)      [[ $# -ge 2 ]] || die "--ssh-port needs a value"; SSH_PORT=$2; shift 2 ;;
@@ -188,6 +196,7 @@ while [[ $# -gt 0 ]]; do
     --mux)           MUX=1; MUX_SET=1; shift ;;
     --transport)     [[ $# -ge 2 ]] || die "--transport needs a value"; TRANSPORT=$2; TRANSPORT_SET=1; shift 2 ;;
     --service-name)  [[ $# -ge 2 ]] || die "--service-name needs a value"; GRPC_SERVICE=$2; shift 2 ;;
+    --xhttp-path)    [[ $# -ge 2 ]] || die "--xhttp-path needs a value"; XHTTP_PATH=$2; shift 2 ;;
     --enable-mux)    ACTION="enable-mux"; shift ;;
     --disable-mux)   ACTION="disable-mux"; shift ;;
     --regen-keys)    REGEN_KEYS=1; shift ;;
@@ -205,9 +214,9 @@ done
 
 case "$WARP" in all|off) ;; *) die "--warp must be all or off" ;; esac
 case "$CERT_METHOD" in http|dns|none) ;; *) die "--cert-method must be http, dns or none" ;; esac
-case "$TRANSPORT" in tcp|grpc) ;; *) die "--transport must be tcp or grpc" ;; esac
-if [[ $MUX -eq 1 && $TRANSPORT == "grpc" ]]; then
-  die "--mux is only for tcp; gRPC already multiplexes"
+case "$TRANSPORT" in tcp|grpc|xhttp) ;; *) die "--transport must be tcp, grpc or xhttp" ;; esac
+if [[ $MUX -eq 1 && $TRANSPORT != "tcp" ]]; then
+  die "--mux is only for tcp; grpc and xhttp already multiplex"
 fi
 [[ $SSH_PORT =~ ^[0-9]+$ ]] || die "--ssh-port must be numeric"
 
@@ -276,6 +285,39 @@ collect_params() {
     fi
   fi
 
+  if [[ $NONINTERACTIVE -eq 0 ]] && have_tty; then
+    if [[ $TRANSPORT_SET -eq 0 ]]; then
+      local _t
+      while true; do
+        read -rp "Transport [tcp/grpc/xhttp] ($TRANSPORT): " _t < /dev/tty || die "no input"
+        _t=${_t:-$TRANSPORT}
+        case "$_t" in
+          tcp|grpc|xhttp) TRANSPORT=$_t; break ;;
+          *) warn "enter tcp, grpc or xhttp" ;;
+        esac
+      done
+    fi
+
+    if [[ $WARP_SET -eq 0 ]]; then
+      local _w _wdef="Y/n"
+      [[ $WARP == "off" ]] && _wdef="y/N"
+      read -rp "Route all traffic through Cloudflare WARP? [$_wdef]: " _w < /dev/tty || true
+      case "$_w" in n|N|no|No) WARP="off" ;; *) WARP="all" ;; esac
+    fi
+
+    if [[ $BLOCK_RU_SET -eq 0 ]]; then
+      local _b _bdef="Y/n"
+      [[ $BLOCK_RU -eq 0 ]] && _bdef="y/N"
+      read -rp "Block .ru/.su/geoip:ru destinations? [$_bdef]: " _b < /dev/tty || true
+      case "$_b" in n|N|no|No) BLOCK_RU=0 ;; *) BLOCK_RU=1 ;; esac
+    fi
+  fi
+
+  case "$TRANSPORT" in tcp|grpc|xhttp) ;; *) die "--transport must be tcp, grpc or xhttp" ;; esac
+  if [[ $MUX -eq 1 && $TRANSPORT != "tcp" ]]; then
+    die "--mux is only for tcp; grpc and xhttp already multiplex"
+  fi
+
   if [[ -z $ENDPOINT ]]; then
     ENDPOINT=$(detect_ipv6 || true)
   fi
@@ -285,13 +327,17 @@ collect_params() {
   if [[ $TRANSPORT == "grpc" && -z $GRPC_SERVICE ]]; then
     GRPC_SERVICE="Gun$(openssl rand -hex 6)"
   fi
-  if [[ $TRANSPORT == "grpc" ]]; then
+  if [[ $TRANSPORT == "xhttp" ]]; then
+    [[ -n $XHTTP_PATH ]] || XHTTP_PATH="/$(openssl rand -hex 6)"
+    [[ $XHTTP_PATH == /* ]] || XHTTP_PATH="/$XHTTP_PATH"
+  fi
+  if [[ $TRANSPORT != "tcp" ]]; then
     MUX=0
   fi
 
   ok "domain: $DOMAIN"
   ok "endpoint: $ENDPOINT"
-  ok "transport: $TRANSPORT${GRPC_SERVICE:+ ($GRPC_SERVICE)}"
+  ok "transport: $TRANSPORT${GRPC_SERVICE:+ ($GRPC_SERVICE)}${XHTTP_PATH:+ ($XHTTP_PATH)}"
 }
 
 check_ports() {
@@ -603,7 +649,6 @@ PY
 }
 
 prepare_warp() {
-  [[ $WARP == "all" ]] || { ok "WARP disabled"; return 0; }
   local dir="$STATE_DIR/warp"
   mkdir -p "$dir"
 
@@ -627,7 +672,11 @@ prepare_warp() {
     WARP="off"
     return 0
   fi
-  ok "WARP profile ready ($WG_ENDPOINT)"
+  if [[ $WARP == "off" ]]; then
+    ok "WARP profile ready ($WG_ENDPOINT), currently disabled"
+  else
+    ok "WARP profile ready ($WG_ENDPOINT)"
+  fi
 }
 
 fix_xray_perms() {
@@ -694,6 +743,10 @@ write_xray_config() {
     base=$(jq --arg svc "$GRPC_SERVICE" \
       '.inbounds[0].streamSettings.grpcSettings = {serviceName:$svc}' <<<"$base") \
       || die "cannot add gRPC settings"
+  elif [[ $TRANSPORT == "xhttp" ]]; then
+    base=$(jq --arg path "$XHTTP_PATH" --arg host "$DOMAIN" \
+      '.inbounds[0].streamSettings.xhttpSettings = {path:$path, host:$host, mode:"auto"}' <<<"$base") \
+      || die "cannot add XHTTP settings"
   fi
 
   rules='[]'
@@ -824,13 +877,27 @@ save_state() {
     --argjson mux "$MUX" \
     --arg transport "$TRANSPORT" \
     --arg grpc "$GRPC_SERVICE" \
+    --arg xhttp "$XHTTP_PATH" \
     --arg cert "$CERT_CRT" \
     --arg installed "$(date -Is)" \
     '{domain:$domain, uuid:$uuid, private_key:$priv, public_key:$pub, short_id:$sid,
       endpoint:$endpoint, warp:$warp, block_ru:$block_ru, mux:$mux,
-      transport:$transport, grpc_service:$grpc, cert:$cert, installed_at:$installed}' \
+      transport:$transport, grpc_service:$grpc, xhttp_path:$xhttp, cert:$cert, installed_at:$installed}' \
     > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
+}
+
+xhttp_note() {
+  [[ $TRANSPORT == "xhttp" ]] || return 0
+  cat <<EOF
+
+XHTTP transport: HTTP-multiplexed streams over one TCP connection.
+Stock sing-box does not support XHTTP: use an Xray-based client
+(v2rayN, v2rayNG, NekoBox with Xray core) or sing-box-extended.
+  path: $XHTTP_PATH
+  host: $DOMAIN
+  mode: auto
+EOF
 }
 
 grpc_note() {
@@ -884,6 +951,7 @@ print_links() {
   printf '\n'
   mux_note
   grpc_note
+  xhttp_note
 }
 
 print_summary() {
@@ -895,7 +963,7 @@ ${C_GRN}Installation complete${C_OFF}
   endpoint     : $ENDPOINT
   WARP         : $WARP
   block RU     : $BLOCK_RU
-  transport    : $TRANSPORT${GRPC_SERVICE:+ ($GRPC_SERVICE)}
+  transport    : $TRANSPORT${GRPC_SERVICE:+ ($GRPC_SERVICE)}${XHTTP_PATH:+ ($XHTTP_PATH)}
   mux          : $MUX
   certificate  : $CERT_CRT
 
@@ -907,6 +975,7 @@ ${C_GRN}Installation complete${C_OFF}
   Show links   : bash install.sh --links
   Status       : bash install.sh --status
   Uninstall    : bash install.sh --uninstall
+  Manage       : xray-manage status | links | user add | user del | warp on | warp off
 
   Check from the client:
     curl -6 https://$DOMAIN            # decoy page
@@ -914,6 +983,25 @@ ${C_GRN}Installation complete${C_OFF}
 
 EOF
   print_links
+}
+
+install_manager() {
+  log "installing management script"
+  local self_dir=""
+  if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then
+    self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+  fi
+  if [[ -n $self_dir && -f "$self_dir/manage.sh" ]]; then
+    install -m 755 "$self_dir/manage.sh" /usr/local/bin/xray-manage
+    ok "xray-manage installed"
+    return 0
+  fi
+  if curl -fsSL --max-time 30 "$MANAGE_URL" -o /usr/local/bin/xray-manage 2>/dev/null; then
+    chmod 755 /usr/local/bin/xray-manage
+    ok "xray-manage installed"
+  else
+    warn "cannot download manage.sh; xray-manage is not installed"
+  fi
 }
 
 do_install() {
@@ -942,6 +1030,7 @@ do_install() {
   start_xray
   verify_install
   save_state
+  install_manager
   print_summary
 }
 
@@ -960,12 +1049,14 @@ load_transport_state() {
   if [[ $v == "grpc" ]]; then TRANSPORT="grpc"; fi
   v=$(jq -r '.grpc_service // empty' "$STATE_FILE" 2>/dev/null || true)
   if [[ -n $v && -z $GRPC_SERVICE ]]; then GRPC_SERVICE=$v; fi
+  v=$(jq -r '.xhttp_path // empty' "$STATE_FILE" 2>/dev/null || true)
+  if [[ -n $v && -z $XHTTP_PATH ]]; then XHTTP_PATH=$v; fi
   return 0
 }
 
 load_mux_state() {
   [[ -f $STATE_FILE ]] || return 0
-  if [[ $TRANSPORT == "grpc" ]]; then MUX=0; return 0; fi
+  if [[ $TRANSPORT != "tcp" ]]; then MUX=0; return 0; fi
   [[ $MUX_SET -eq 1 ]] && return 0
   local v
   v=$(jq -r '.mux // false' "$STATE_FILE" 2>/dev/null || true)
@@ -1038,6 +1129,7 @@ do_links() {
   done < <(jq -r '.inbounds[0].settings.clients[] | [(.email // "user"), .id] | @tsv' "$XRAY_CONF")
   mux_note
   grpc_note
+  xhttp_note
 }
 
 do_enable_mux() {
@@ -1046,8 +1138,8 @@ do_enable_mux() {
   load_transport_state
   load_mux_state
   [[ -f $XRAY_CONF ]] || die "missing $XRAY_CONF"
-  if [[ $TRANSPORT == "grpc" ]]; then
-    die "gRPC already multiplexes; mux is only for tcp (switch with --transport tcp)"
+  if [[ $TRANSPORT != "tcp" ]]; then
+    die "mux is only for tcp; grpc and xhttp already multiplex"
   fi
   if [[ $MUX -eq 1 ]]; then
     ok "mux mode is already enabled"
