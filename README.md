@@ -91,6 +91,8 @@ sudo bash install.sh --domain vpn.example.com --email you@example.com --warp off
 | `--ssh-port PORT` | SSH-порт, который останется открыт (по умолчанию 22) |
 | `--qr` | QR-код ссылки в терминале |
 | `--mux` | отключить Vision и разрешить Mux.Cool на клиенте |
+| `--transport tcp\|grpc` | `tcp` — Vision (по умолчанию), `grpc` — HTTP/2-мультиплексирование |
+| `--service-name NAME` | имя gRPC-сервиса (генерируется автоматически) |
 | `--regen-keys` | новые UUID, ключи Reality, shortId |
 | `--force` | переустановка поверх |
 | `--non-interactive` | без вопросов (нужны `--domain`, `--email`) |
@@ -143,6 +145,24 @@ bash install.sh --disable-mux    # вернуть Vision
 После переключения нужны новые ссылки (в них не будет `flow=...`). В клиенте включите Mux: `concurrency` 8–16, `xudpConcurrency` 16–32, `xudpProxyUDP443 = reject`.
 
 Ограничения: Mux.Cool понимают только Xray-клиенты (v2rayN, v2rayNG, NekoBox с Xray). sing-box/Hiddify используют smux и с Xray Mux.Cool не совместимы — они продолжат работать без мультиплексирования. Без Vision теряется splice и часть маскировки TLS-in-TLS; если проблема не в количестве соединений, лучше оставить Vision.
+
+### sing-box: gRPC вместо XHTTP
+
+Stock sing-box не поддерживает XHTTP: в 1.13/1.14 доступны HTTP, WebSocket, QUIC, gRPC и HTTPUpgrade; XHTTP есть только в форках вроде sing-box-extended. Зато Xray REALITY поддерживает RAW, XHTTP и gRPC, а gRPC есть в обоих ядрах.
+
+gRPC работает поверх HTTP/2: все проксируемые потоки идут через одно TCP-соединение, как раз то, что нужно против «шторма» соединений.
+
+```bash
+bash install.sh --transport grpc
+```
+
+Скрипт сгенерирует случайный `serviceName`, переключит сервер, сохранит состояние и напечатает ссылку вида `type=grpc&serviceName=...` (без `flow`) плюс готовый sing-box outbound. Обратно:
+
+```bash
+bash install.sh --transport tcp
+```
+
+Ограничения: gRPC медленнее RAW/Vision на больших загрузках, а Vision с ним недоступен. Для одного пользователя и браузинга это обычно приемлемая плата за стабильность.
 
 ## Ограничения и риски
 

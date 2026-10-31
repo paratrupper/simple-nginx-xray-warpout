@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 
 APP_NAME="simple-nginx-xray-warpout"
-APP_VERSION="1.1.0"
+APP_VERSION="1.2.0"
 
 STATE_DIR="/etc/xray-installer"
 STATE_FILE="$STATE_DIR/state.json"
@@ -36,6 +36,9 @@ NONINTERACTIVE=0
 DO_QR=0
 MUX=0
 MUX_SET=0
+TRANSPORT="tcp"
+TRANSPORT_SET=0
+GRPC_SERVICE=""
 ACTION="install"
 ADD_USER_NAME=""
 
@@ -88,6 +91,8 @@ Options:
   --email ADDR           Let's Encrypt account email (asked if omitted)
   --endpoint HOST        address used in the client link (default: detected IPv6)
   --warp all|off         route all traffic through Cloudflare WARP (default all)
+  --transport tcp|grpc   tcp = Vision (default), grpc = HTTP/2 multiplexing (works with sing-box)
+  --service-name NAME    gRPC service name (generated automatically for grpc)
   --block-ru             block .ru/.xn--p1ai/.su and geoip:ru (default)
   --no-block-ru          do not block Russian destinations
   --cert-method http|dns|none   certificate source (default http)
@@ -156,12 +161,14 @@ link_host() {
 }
 
 make_link() {
-  local host=$1 uuid=$2 flowparam=""
-  if [[ $MUX -eq 0 ]]; then
+  local host=$1 uuid=$2 flowparam="" typeparam="type=tcp"
+  if [[ $TRANSPORT == "grpc" ]]; then
+    typeparam="type=grpc&serviceName=$GRPC_SERVICE"
+  elif [[ $MUX -eq 0 ]]; then
     flowparam="&flow=xtls-rprx-vision"
   fi
-  printf 'vless://%s@%s:443?encryption=none%s&security=reality&sni=%s&fp=firefox&pbk=%s&sid=%s&type=tcp#%s\n' \
-    "$uuid" "$(link_host "$host")" "$flowparam" "$DOMAIN" "$PUBLIC_KEY" "$SHORT_ID" "$DOMAIN"
+  printf 'vless://%s@%s:443?encryption=none%s&security=reality&sni=%s&fp=firefox&pbk=%s&sid=%s&%s#%s\n' \
+    "$uuid" "$(link_host "$host")" "$flowparam" "$DOMAIN" "$PUBLIC_KEY" "$SHORT_ID" "$typeparam" "$DOMAIN"
 }
 
 # --------------------------------------------------------------- arg parse --
@@ -179,6 +186,8 @@ while [[ $# -gt 0 ]]; do
     --ssh-port)      [[ $# -ge 2 ]] || die "--ssh-port needs a value"; SSH_PORT=$2; shift 2 ;;
     --qr)            DO_QR=1; shift ;;
     --mux)           MUX=1; MUX_SET=1; shift ;;
+    --transport)     [[ $# -ge 2 ]] || die "--transport needs a value"; TRANSPORT=$2; TRANSPORT_SET=1; shift 2 ;;
+    --service-name)  [[ $# -ge 2 ]] || die "--service-name needs a value"; GRPC_SERVICE=$2; shift 2 ;;
     --enable-mux)    ACTION="enable-mux"; shift ;;
     --disable-mux)   ACTION="disable-mux"; shift ;;
     --regen-keys)    REGEN_KEYS=1; shift ;;
@@ -196,6 +205,10 @@ done
 
 case "$WARP" in all|off) ;; *) die "--warp must be all or off" ;; esac
 case "$CERT_METHOD" in http|dns|none) ;; *) die "--cert-method must be http, dns or none" ;; esac
+case "$TRANSPORT" in tcp|grpc) ;; *) die "--transport must be tcp or grpc" ;; esac
+if [[ $MUX -eq 1 && $TRANSPORT == "grpc" ]]; then
+  die "--mux is only for tcp; gRPC already multiplexes"
+fi
 [[ $SSH_PORT =~ ^[0-9]+$ ]] || die "--ssh-port must be numeric"
 
 # ------------------------------------------------------------------ install --
@@ -239,6 +252,7 @@ load_state() {
   fi
   v=$(jq -r '.endpoint // empty' "$STATE_FILE" 2>/dev/null || true)
   [[ -n $v && -z $ENDPOINT ]] && ENDPOINT=$v
+  load_transport_state
   load_mux_state
   return 0
 }
@@ -267,8 +281,17 @@ collect_params() {
   fi
   [[ -n $ENDPOINT ]] || die "no global IPv6 address found; pass --endpoint"
   ENDPOINT=${ENDPOINT#\[}; ENDPOINT=${ENDPOINT%\]}
+
+  if [[ $TRANSPORT == "grpc" && -z $GRPC_SERVICE ]]; then
+    GRPC_SERVICE="Gun$(openssl rand -hex 6)"
+  fi
+  if [[ $TRANSPORT == "grpc" ]]; then
+    MUX=0
+  fi
+
   ok "domain: $DOMAIN"
   ok "endpoint: $ENDPOINT"
+  ok "transport: $TRANSPORT${GRPC_SERVICE:+ ($GRPC_SERVICE)}"
 }
 
 check_ports() {
@@ -624,7 +647,7 @@ write_xray_config() {
   mkdir -p "$XRAY_DIR"
 
   local base rules default_rule wg client_json
-  if [[ $MUX -eq 1 ]]; then
+  if [[ $TRANSPORT == "grpc" || $MUX -eq 1 ]]; then
     client_json=$(jq -n --arg uuid "$UUID_VALUE" '{id:$uuid, email:"user1"}')
   else
     client_json=$(jq -n --arg uuid "$UUID_VALUE" '{id:$uuid, flow:"xtls-rprx-vision", email:"user1"}')
@@ -635,6 +658,7 @@ write_xray_config() {
     --arg domain "$DOMAIN" \
     --arg priv "$PRIVATE_KEY" \
     --arg sid "$SHORT_ID" \
+    --arg net "$TRANSPORT" \
     '{
       log: {loglevel: "warning"},
       inbounds: [{
@@ -647,7 +671,7 @@ write_xray_config() {
           decryption: "none"
         },
         streamSettings: {
-          network: "tcp",
+          network: $net,
           security: "reality",
           realitySettings: {
             target: "127.0.0.1:8443",
@@ -665,6 +689,12 @@ write_xray_config() {
       ],
       routing: {domainStrategy: "IPIfNonMatch", rules: []}
     }') || die "cannot build base config"
+
+  if [[ $TRANSPORT == "grpc" ]]; then
+    base=$(jq --arg svc "$GRPC_SERVICE" \
+      '.inbounds[0].streamSettings.grpcSettings = {serviceName:$svc}' <<<"$base") \
+      || die "cannot add gRPC settings"
+  fi
 
   rules='[]'
   if [[ $BLOCK_RU -eq 1 ]]; then
@@ -792,12 +822,38 @@ save_state() {
     --arg warp "$WARP" \
     --argjson block_ru "$BLOCK_RU" \
     --argjson mux "$MUX" \
+    --arg transport "$TRANSPORT" \
+    --arg grpc "$GRPC_SERVICE" \
     --arg cert "$CERT_CRT" \
     --arg installed "$(date -Is)" \
     '{domain:$domain, uuid:$uuid, private_key:$priv, public_key:$pub, short_id:$sid,
-      endpoint:$endpoint, warp:$warp, block_ru:$block_ru, mux:$mux, cert:$cert, installed_at:$installed}' \
+      endpoint:$endpoint, warp:$warp, block_ru:$block_ru, mux:$mux,
+      transport:$transport, grpc_service:$grpc, cert:$cert, installed_at:$installed}' \
     > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
+}
+
+grpc_note() {
+  [[ $TRANSPORT == "grpc" ]] || return 0
+  cat <<EOF
+
+gRPC transport: HTTP/2 multiplexes all streams over one TCP connection.
+sing-box outbound example:
+
+{
+  "type": "vless",
+  "server": "$ENDPOINT",
+  "server_port": 443,
+  "uuid": "$UUID_VALUE",
+  "tls": {
+    "enabled": true,
+    "server_name": "$DOMAIN",
+    "utls": {"enabled": true, "fingerprint": "firefox"},
+    "reality": {"enabled": true, "public_key": "$PUBLIC_KEY", "short_id": "$SHORT_ID"}
+  },
+  "transport": {"type": "grpc", "service_name": "$GRPC_SERVICE"}
+}
+EOF
 }
 
 mux_note() {
@@ -827,6 +883,7 @@ print_links() {
   fi
   printf '\n'
   mux_note
+  grpc_note
 }
 
 print_summary() {
@@ -838,6 +895,7 @@ ${C_GRN}Installation complete${C_OFF}
   endpoint     : $ENDPOINT
   WARP         : $WARP
   block RU     : $BLOCK_RU
+  transport    : $TRANSPORT${GRPC_SERVICE:+ ($GRPC_SERVICE)}
   mux          : $MUX
   certificate  : $CERT_CRT
 
@@ -894,8 +952,20 @@ require_state() {
   command -v jq >/dev/null || die "jq is required"
 }
 
+load_transport_state() {
+  [[ -f $STATE_FILE ]] || return 0
+  [[ $TRANSPORT_SET -eq 1 ]] && return 0
+  local v
+  v=$(jq -r '.transport // "tcp"' "$STATE_FILE" 2>/dev/null || true)
+  if [[ $v == "grpc" ]]; then TRANSPORT="grpc"; fi
+  v=$(jq -r '.grpc_service // empty' "$STATE_FILE" 2>/dev/null || true)
+  if [[ -n $v && -z $GRPC_SERVICE ]]; then GRPC_SERVICE=$v; fi
+  return 0
+}
+
 load_mux_state() {
   [[ -f $STATE_FILE ]] || return 0
+  if [[ $TRANSPORT == "grpc" ]]; then MUX=0; return 0; fi
   [[ $MUX_SET -eq 1 ]] && return 0
   local v
   v=$(jq -r '.mux // false' "$STATE_FILE" 2>/dev/null || true)
@@ -906,13 +976,14 @@ load_mux_state() {
 do_add_user() {
   require_root
   require_state
+  load_transport_state
   load_mux_state
   [[ -f $XRAY_CONF ]] || die "missing $XRAY_CONF"
   local name id backup link count flowval=""
   count=$(jq '.inbounds[0].settings.clients | length' "$XRAY_CONF")
   name=${ADD_USER_NAME:-user$((count + 1))}
   id=$(xray uuid)
-  if [[ $MUX -eq 0 ]]; then flowval="xtls-rprx-vision"; fi
+  if [[ $TRANSPORT == "tcp" && $MUX -eq 0 ]]; then flowval="xtls-rprx-vision"; fi
 
   backup_file "$XRAY_CONF"
   backup="$XRAY_CONF.bak.$$"
@@ -945,11 +1016,13 @@ do_add_user() {
 do_links() {
   require_state
   [[ -f $XRAY_CONF ]] || die "missing $XRAY_CONF"
+  load_transport_state
   load_mux_state
   DOMAIN=$(jq -r '.domain' "$STATE_FILE")
   PUBLIC_KEY=$(jq -r '.public_key' "$STATE_FILE")
   SHORT_ID=$(jq -r '.short_id' "$STATE_FILE")
   ENDPOINT=$(jq -r '.endpoint' "$STATE_FILE")
+  UUID_VALUE=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$XRAY_CONF")
 
   local name id domain_live=0
   if getent ahostsv6 "$DOMAIN" >/dev/null 2>&1; then domain_live=1; fi
@@ -964,13 +1037,18 @@ do_links() {
     printf '\n'
   done < <(jq -r '.inbounds[0].settings.clients[] | [(.email // "user"), .id] | @tsv' "$XRAY_CONF")
   mux_note
+  grpc_note
 }
 
 do_enable_mux() {
   require_root
   require_state
+  load_transport_state
   load_mux_state
   [[ -f $XRAY_CONF ]] || die "missing $XRAY_CONF"
+  if [[ $TRANSPORT == "grpc" ]]; then
+    die "gRPC already multiplexes; mux is only for tcp (switch with --transport tcp)"
+  fi
   if [[ $MUX -eq 1 ]]; then
     ok "mux mode is already enabled"
     do_links
