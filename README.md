@@ -90,6 +90,7 @@ sudo bash install.sh --domain vpn.example.com --email you@example.com --warp off
 | `--cf-token TOKEN` | токен Cloudflare для DNS-01 |
 | `--ssh-port PORT` | SSH-порт, который останется открыт (по умолчанию 22) |
 | `--qr` | QR-код ссылки в терминале |
+| `--mux` | отключить Vision и разрешить Mux.Cool на клиенте |
 | `--regen-keys` | новые UUID, ключи Reality, shortId |
 | `--force` | переустановка поверх |
 | `--non-interactive` | без вопросов (нужны `--domain`, `--email`) |
@@ -126,6 +127,22 @@ curl -6 https://vpn.example.com                 # заглушка
 curl https://www.cloudflare.com/cdn-cgi/trace   # warp=on, если WARP работает
 curl ifconfig.me                                # выходной IP
 ```
+
+## Много одновременных соединений
+
+VLESS/TCP не мультиплексирует: каждый проксируемый поток (TCP-соединение сайта или UDP-сессия) идёт отдельным TCP-соединением до сервера. Браузер с десятком вкладок легко даёт сотни соединений, и провайдерский DPI может на это реагировать.
+
+Xray умеет Mux.Cool — несколько потоков в одном TCP. Но он несовместим с Vision, поэтому режим переключает сервер на обычный VLESS+REALITY без `flow`:
+
+```bash
+bash install.sh --mux            # при установке
+bash install.sh --enable-mux     # на уже установленном
+bash install.sh --disable-mux    # вернуть Vision
+```
+
+После переключения нужны новые ссылки (в них не будет `flow=...`). В клиенте включите Mux: `concurrency` 8–16, `xudpConcurrency` 16–32, `xudpProxyUDP443 = reject`.
+
+Ограничения: Mux.Cool понимают только Xray-клиенты (v2rayN, v2rayNG, NekoBox с Xray). sing-box/Hiddify используют smux и с Xray Mux.Cool не совместимы — они продолжат работать без мультиплексирования. Без Vision теряется splice и часть маскировки TLS-in-TLS; если проблема не в количестве соединений, лучше оставить Vision.
 
 ## Ограничения и риски
 
